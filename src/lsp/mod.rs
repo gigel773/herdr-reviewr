@@ -551,7 +551,11 @@ impl Worker {
     fn fail(&mut self, index: usize, message: &str) {
         let Some(mut live) = self.servers[index].take() else { return };
         let queued = live.starting.take().map(|(_, q)| q).unwrap_or_default();
-        for asked in queued.into_iter().chain(live.asked.into_values()) {
+        let failed: Vec<_> =
+            queued.into_iter().chain(std::mem::take(&mut live.asked).into_values()).collect();
+        // Stopped before its failures land, so no answer outlives the server it blames.
+        drop(live);
+        for asked in failed {
             self.deliver(&asked.tag, Some(asked.index), Outcome::Failed(message.to_string()));
         }
     }
