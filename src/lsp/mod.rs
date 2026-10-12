@@ -777,6 +777,7 @@ mod tests {
             std::fs::read_to_string(self.repo.path().join(".fake-lsp/lsp.log")).unwrap_or_default()
         }
 
+        #[cfg(unix)]
         fn pid(&self) -> String {
             std::fs::read_to_string(self.repo.path().join(".fake-lsp/pid")).unwrap()
         }
