@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Code navigation for C, C++ and Go**: `D` lists the definitions of every symbol on the line,
+  `R` lists a symbol's references, and `alt+←` / `alt+→` walk back and forward through your
+  jumps. reviewr asks clangd or gopls. The server starts on your first press and stops with the
+  pane. A hidden pane keeps it, since one takes seconds to start. Answers fill a list that never
+  moves your place. The picked place shows with five lines each side. `Enter` jumps there, and `e`
+  opens a place outside the worktree in your editor.
+- **`clangd`, `gopls` and `clangd_index` config keys**: a program path for each server, and
+  clangd's background index, off by default so nothing is written to the worktree.
+
 ## [0.46.0] — 2026-10-06
 
 ### Changed

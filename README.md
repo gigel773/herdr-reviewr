@@ -155,6 +155,19 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | `y` | Copy comments to clipboard |
 | `esc` | Clear selection |
 
+**Code navigation** (C and C++ through clangd, Go through gopls)
+
+| Key | Action |
+| --- | --- |
+| `D` | List the definitions of every symbol on the line |
+| `R` | Pick a symbol on the line, then list its references |
+| `alt+←` `alt+→` | Go back / forward through the places you jumped from |
+
+In the list, `j` / `k` move, `Enter` jumps to a place in the worktree (or picks the symbol for
+`R`), `e` opens any place in your editor, outside or git-ignored files included, and `Esc`
+closes it and leaves you where you were. Under the list, the picked place shows with five lines
+each side.
+
 **In the comment box**
 
 | Key | Action |
@@ -236,6 +249,9 @@ toggle_direction = "down"
 auto_open = false
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
+clangd = "/opt/llvm/bin/clangd"
+gopls = "/home/me/go/bin/gopls"
+clangd_index = false
 
 [keybindings]
 comment = ["c", "ㅊ"]
@@ -321,6 +337,51 @@ else is your editor's:
 ```toml
 editor = "code -g {file}:{line}"
 ```
+
+### Language servers
+
+`D` and `R` ask a language server about the current file: clangd for C and C++, gopls for Go.
+reviewr starts one the first time you press either key in a file of its language, keeps it while
+the pane lives (hidden too, since a server takes seconds to start), and stops it when the pane
+closes. Until you press them, no server runs. Without the program installed, the list says how to
+get it.
+
+reviewr runs the program from your `PATH`. To use another one, name its path. Only a path, no
+arguments:
+
+```toml
+clangd = "/opt/llvm/bin/clangd"
+gopls = "/home/me/go/bin/gopls"
+```
+
+A configured program is yours to trust: reviewr can't promise a program it didn't pick writes
+nothing in your worktree.
+
+Answers follow the files on disk, so `D` on a `Changes` line first opens that line in
+**All files**, where a server reads it. Places outside the worktree, and files git ignores (such
+as generated headers in `build/`), show in the list, and `e` opens them in your editor.
+
+**clangd** finds the project's compile database by itself: `compile_commands.json` in the root
+or `build/`, `compile_flags.txt`, or whatever the project's `.clangd` names. A worktree without
+one (a fresh checkout before its first build) gets weak answers, and the list says so.
+
+By default clangd keeps no index, so it writes nothing. It then knows the open file and the
+headers it includes: a call into another `.cpp` often lands on the declaration, and references
+stop at what it has read. For whole-project answers, let it index:
+
+```toml
+clangd_index = true
+```
+
+clangd then writes its index to `.cache/clangd/index` under the folder where it found the compile
+database, and adds a `.gitignore` there so git never lists the files. With the database in the
+worktree (in its root or `build/`), that is inside the worktree, and **All files** shows `.cache/`
+as an ignored folder. With a database outside it, the index lands outside too, and worktrees that
+share that database share the index. The first index of a large project takes minutes of CPU.
+
+**gopls** keeps its caches where Go's own settings put them (`GOCACHE`, `GOMODCACHE`), outside
+the worktree unless your environment points them inside. reviewr drops any `-mod=` from the
+`GOFLAGS` it passes on, so gopls's own `go` runs never rewrite `go.mod` or `go.sum`.
 
 ### URL opener
 
@@ -513,6 +574,16 @@ The known constraints:
   failure leaves everything in place.
 - **No line-number rebasing** — a comment stays locatable by its diff snippet, not its line
   number. reviewr flags a stale comment instead of dropping it.
+
+**Code navigation**
+- **C++ without an index is partial** — see [Language servers](#language-servers).
+- **Servers are private to a pane** — reviewr never shares an editor's or another pane's server.
+  Each pane starts its own, one per language it was asked about, so a pane reviewing Go and C++
+  runs both gopls and clangd.
+- **No viewer for outside files yet** — a definition in a system header, the Go standard
+  library, or a git-ignored file opens in your editor, and the jump chain stops there.
+- **`R` asks a server per symbol** — picking one symbol on a busy line asks for the definitions
+  of all of them first, so it can tell overloads apart.
 
 **Budgets**
 - Files over 2 MB or 50,000 lines show a "too large" notice. Binary files get no diff.

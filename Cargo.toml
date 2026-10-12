@@ -48,6 +48,8 @@ time = { version = "0.3", features = ["parsing"] }
 toml = "1.1"
 two-face = "0.5.2"
 unicode-width = "0.2"
+# Already in the tree. A language server's file URIs to paths and back, on unix and Windows alike.
+url = "2.5.8"
 # Program lookup the way a shell does it: the executable bit on unix, PATHEXT on Windows
 # (so `az` finds `az.cmd`), and never the current directory for a bare name.
 which = "8.0.6"

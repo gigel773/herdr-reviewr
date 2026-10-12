@@ -60,7 +60,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 13] = [
+const PLUGIN_CONFIG_KEYS: [&str; 16] = [
     "theme",
     "default_scope",
     "markdown_view",
@@ -73,6 +73,9 @@ const PLUGIN_CONFIG_KEYS: [&str; 13] = [
     "azure_devops_host",
     "editor",
     "url_opener",
+    "clangd",
+    "gopls",
+    "clangd_index",
     "keybindings",
 ];
 
@@ -173,6 +176,9 @@ pub struct PluginConfig {
     azure_devops_host: Option<String>,
     editor: Option<String>,
     url_opener: Option<String>,
+    clangd: Option<String>,
+    gopls: Option<String>,
+    clangd_index: bool,
     keymap: crate::keymap::Keymap,
 }
 
@@ -191,6 +197,9 @@ impl Default for PluginConfig {
             azure_devops_host: None,
             editor: None,
             url_opener: None,
+            clangd: None,
+            gopls: None,
+            clangd_index: false,
             keymap: crate::keymap::Keymap::default(),
         }
     }
@@ -255,6 +264,21 @@ impl PluginConfig {
 
     pub fn url_opener(&self) -> Option<&str> {
         self.url_opener.as_deref()
+    }
+
+    /// The clangd program to run instead of the one on `PATH`.
+    pub fn clangd(&self) -> Option<&str> {
+        self.clangd.as_deref()
+    }
+
+    /// The gopls program to run instead of the one on `PATH`.
+    pub fn gopls(&self) -> Option<&str> {
+        self.gopls.as_deref()
+    }
+
+    /// Whether clangd keeps its background index, which it writes beside its compile database.
+    pub fn clangd_index(&self) -> bool {
+        self.clangd_index
     }
 
     /// The resolved keymap: the defaults with this snapshot's `[keybindings]` applied.
@@ -464,6 +488,20 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             ));
         }
         config.url_opener = Some(command.to_owned());
+    }
+    for (key, slot) in [("clangd", &mut config.clangd), ("gopls", &mut config.gopls)] {
+        if let Some(value) = table.get(key) {
+            // A program path, never a command line: an argument could point a server's writes anywhere.
+            let program = value
+                .as_str()
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| value_error(path, value, key, "a non-empty program path"))?;
+            *slot = Some(program.to_owned());
+        }
+    }
+    if let Some(value) = table.get("clangd_index") {
+        config.clangd_index =
+            value.as_bool().ok_or_else(|| value_error(path, value, "clangd_index", "a boolean"))?;
     }
     // One hostname per forge; the later key's error names the earlier owner.
     let host_keys = [
@@ -742,6 +780,9 @@ mod tests {
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
         assert_eq!(config.markdown_view(), MarkdownView::Source);
+        assert_eq!(config.clangd(), None);
+        assert_eq!(config.gopls(), None);
+        assert!(!config.clangd_index());
     }
 
     #[test]
@@ -803,6 +844,20 @@ mod tests {
     }
 
     #[test]
+    fn the_language_server_keys_reach_the_resolved_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "clangd = \"/opt/llvm/bin/clangd\"\ngopls = \"gopls\"\nclangd_index = true\n",
+        )
+        .unwrap();
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.clangd(), Some("/opt/llvm/bin/clangd"));
+        assert_eq!(config.gopls(), Some("gopls"));
+        assert!(config.clangd_index());
+    }
+
+    #[test]
     fn unknown_key_and_syntax_error_fail_the_whole_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -846,6 +901,10 @@ mod tests {
             ("editor = \"code {fil\"\n", "`editor`"),
             ("editor = \"code {fi{le} {file}\"\n", "`editor`"),
             ("url_opener = \"\"\n", "`url_opener`"),
+            ("clangd = \"\"\n", "`clangd`"),
+            ("clangd = 42\n", "`clangd`"),
+            ("gopls = \"  \"\n", "`gopls`"),
+            ("clangd_index = \"yes\"\n", "`clangd_index`"),
             ("url_opener = 42\n", "`url_opener`"),
             ("url_opener = \"bridge {ur}\"\n", "`{ur}`"),
             ("url_opener = \"''\"\n", "`url_opener`"),

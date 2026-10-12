@@ -19,6 +19,8 @@ mod input;
 pub mod keymap;
 #[macro_use]
 pub mod log;
+pub mod locations;
+pub mod lsp;
 pub mod markdown;
 pub(crate) mod marks;
 pub mod model;
@@ -147,6 +149,12 @@ fn drain_input(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// The file an editor gets: absolute, so no editor reads it as a flag; symlinks kept.
+fn edit_path(repo: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
+    let joined = repo.join(target);
+    std::path::absolute(&joined).unwrap_or(joined)
+}
+
 /// Open a file in the editor: a terminal one takes the pane, a window one is left running.
 fn run_editor(
     terminal: &mut DefaultTerminal,
@@ -155,9 +163,7 @@ fn run_editor(
     open: &mut Vec<std::process::Child>,
 ) -> Result<()> {
     let Some(target) = app.editor_request.take() else { return Ok(()) };
-    // Absolute, so no editor reads it as a flag; symlinks kept, unlike canonicalize.
-    let joined = app.repo.join(&target.path);
-    let path = std::path::absolute(&joined).unwrap_or(joined);
+    let path = edit_path(&app.repo, &target.path);
     let command = match editor::resolve(
         configured,
         std::env::var("VISUAL").ok().as_deref(),
@@ -181,7 +187,7 @@ fn run_editor(
     };
     // A tracked row can be gone from disk, and an editor would recreate it on save.
     if !path.is_file() {
-        app.status = format!("{} is gone", target.path);
+        app.status = format!("{} is gone", target.path.display());
         return Ok(());
     }
     logln!("editor run {} {:?}", command.program, command.args);
@@ -199,7 +205,7 @@ fn run_editor(
         app.status = match cmd.spawn() {
             Ok(child) => {
                 open.push(child);
-                format!("opened {}", target.path)
+                format!("opened {}", target.path.display())
             }
             Err(e) => format!("editor failed: {e}"),
         };
@@ -217,7 +223,7 @@ fn run_editor(
         // Any exit may follow a write: `:cq` after a save, say.
         Ok(status) => {
             app.status = if status.success() {
-                format!("edited {}", target.path)
+                format!("edited {}", target.path.display())
             } else {
                 format!("editor exited with {status}")
             };
@@ -281,7 +287,7 @@ const PR_POLL: Duration = Duration::from_mins(1);
 /// How long a PR fetch may run before a trigger abandons it.
 const FETCH_HANG: Duration = Duration::from_mins(1);
 /// How long an ambient refresh runs unseen; a commanded one shows at once.
-const INDICATOR_DELAY: Duration = Duration::from_millis(200);
+pub(crate) const INDICATOR_DELAY: Duration = Duration::from_millis(200);
 /// Once lit, the glyph holds at least this long, so a fast landing still reads.
 const INDICATOR_MIN_SHOW: Duration = Duration::from_millis(300);
 const PR_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
@@ -314,6 +320,95 @@ struct PrRefresh {
     fetch_needed: bool,
     /// An ambient trigger rode the in-flight fetch, so one fresh fetch follows it.
     trailing: bool,
+}
+
+/// The frame loop's end of the language-server worker, which the first `D` or `R` starts.
+#[derive(Debug)]
+struct LspLink {
+    jobs: crate::lsp::Jobs,
+    rx: mpsc::Receiver<crate::lsp::LspCompletion>,
+    handle: thread::JoinHandle<()>,
+    gate: crate::lsp::Gate,
+    /// The config the worker runs, compared with the pane's each frame.
+    config: PluginConfig,
+    /// What the watcher saw while the pane hid, told when it shows.
+    unsent: std::collections::BTreeSet<String>,
+    rescan: bool,
+}
+
+impl LspLink {
+    fn start(app: &App, waker: &crate::wake::Waker) -> Option<Self> {
+        let config = app.plugin_config()?.clone();
+        let (tx, rx) = crate::wake::channel(waker);
+        let gate: crate::lsp::Gate = std::sync::Arc::new(std::sync::Mutex::new(true));
+        let (jobs, handle) = crate::lsp::spawn(app.repo.clone(), config.clone(), tx, gate.clone());
+        let (unsent, rescan) = (std::collections::BTreeSet::new(), false);
+        Some(Self { jobs, rx, handle, gate, config, unsent, rescan })
+    }
+
+    fn set_open(&self, open: bool) {
+        *self.gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = open;
+    }
+
+    /// Pass the watcher's news on, or hold it while the pane hides; true when servers restarted.
+    fn watched(&mut self, event: &crate::watch::WatchEvent, visible: bool) -> bool {
+        use crate::watch::WatchEvent;
+        let rescan = match event {
+            // A restarted watcher missed what changed meanwhile.
+            WatchEvent::Ready => true,
+            WatchEvent::Batch(batch) => {
+                self.unsent.extend(batch.files.iter().cloned());
+                batch.rescan
+            }
+            WatchEvent::Unavailable(_) => false,
+        };
+        self.rescan |= rescan;
+        visible && self.flush()
+    }
+
+    /// Tell the worker what was held; true when its servers restarted.
+    fn flush(&mut self) -> bool {
+        let paths: Vec<String> = std::mem::take(&mut self.unsent).into_iter().collect();
+        if !paths.is_empty() {
+            self.jobs.send(crate::lsp::LspJob::Changed { paths });
+        }
+        std::mem::take(&mut self.rescan) && self.jobs.send(crate::lsp::LspJob::Rescan)
+    }
+}
+
+/// Land one answer, if one waits; one sent just before a hide is dropped, and showing re-asks it.
+fn land_lsp(app: &mut App, link: &LspLink) -> bool {
+    let Ok(completion) = link.rx.try_recv() else { return false };
+    if app.pane_visible() {
+        app.apply_lsp_completion(completion);
+    }
+    true
+}
+
+/// After the config read: the worker follows the pane's config, then a shown pane hears answers.
+fn follow_lsp(
+    app: &mut App,
+    lsp: &mut Option<LspLink>,
+    stopping: &mut Vec<thread::JoinHandle<()>>,
+    reopen: &mut bool,
+) {
+    if lsp.as_ref().is_some_and(|link| app.plugin_config() != Some(&link.config)) {
+        match (app.plugin_config().cloned(), lsp.as_mut()) {
+            (Some(config), Some(link)) => {
+                link.jobs.send(crate::lsp::LspJob::Reconfigure(Box::new(config.clone())));
+                link.config = config;
+                app.reask_lsp();
+            }
+            _ => stopping.extend(lsp.take().map(|link| link.handle)),
+        }
+    }
+    if app.pane_visible() && std::mem::take(reopen) {
+        if let Some(link) = lsp.as_mut() {
+            link.set_open(true);
+            link.flush();
+        }
+        app.reask_lsp();
+    }
 }
 
 /// Owns the active probe or fetch until its worker exits; start guards keep all PR work serialized.
@@ -874,6 +969,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
         mpsc::Receiver<crate::search::SearchCompletion>,
     )> = None;
     let mut search_generation = 0_u64;
+    // Started by the first `D` or `R`; kept while the pane hides, for a server's start is slow.
+    let mut lsp: Option<LspLink> = None;
+    // Workers of links a config error or quit stopped, joined once the pane is closing.
+    let mut lsp_stopping: Vec<thread::JoinHandle<()>> = Vec::new();
+    // The pane showed: the gate opens once the config is read.
+    let mut lsp_reopen = false;
     // When the tab-strip glyph turned on — the minimum-display clock.
     let mut glyph_since: Option<Instant> = None;
     let mut config_epoch = 0_u64;
@@ -921,6 +1022,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                     &mut pr,
                 );
             }
+            follow_lsp(app, &mut lsp, &mut lsp_stopping, &mut lsp_reopen);
             if pr.wait_started.is_some_and(|started| started.elapsed() >= INDICATOR_DELAY) {
                 app.set_pr_refreshing(true);
                 pr.wait_started = None;
@@ -1024,6 +1126,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             }
 
             while let Ok(event) = watch_rx.try_recv() {
+                if let Some(link) = lsp.as_mut()
+                    && link.watched(&event, app.pane_visible())
+                {
+                    app.reask_lsp();
+                }
                 let search = search_worker.as_ref().map(|(tx, _)| tx);
                 config_dirty |= land_watch_event(event, app, &mut pacer, &mut pr, search);
             }
@@ -1041,6 +1148,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             // A hidden pane holds no search index; the next search builds it again.
             if moved == Some(false) {
                 search_worker = None;
+            }
+            // A hidden pane hears no answer; its servers keep running.
+            match (moved, lsp.as_ref()) {
+                (Some(false), Some(link)) => link.set_open(false),
+                (Some(true), _) => lsp_reopen = true,
+                _ => {}
             }
             if let Some(visible) = moved {
                 logln!("visible={visible}");
@@ -1060,6 +1173,25 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 land_search_completion(app, completion, search_generation);
                 // Repaint at once, not at the next wake.
                 continue;
+            }
+            if lsp.as_ref().is_some_and(|link| land_lsp(app, link)) {
+                continue;
+            }
+            // After the paint, so the list shows at once; the cancel first, so it spares the new query.
+            if app.pane_visible() && app.config_error().is_none() {
+                if std::mem::take(&mut app.lsp_cancel)
+                    && let Some(link) = &lsp
+                {
+                    link.jobs.send(crate::lsp::LspJob::Cancel);
+                }
+                if let Some(query) = app.lsp_query.take() {
+                    if lsp.is_none() {
+                        lsp = LspLink::start(app, &waker);
+                    }
+                    if let Some(link) = &lsp {
+                        link.jobs.send(crate::lsp::LspJob::Query(query));
+                    }
+                }
             }
 
             // Query after the paint, so typing paints at input speed; a hidden pane queries nothing.
@@ -1288,6 +1420,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             if let Some(started) = pr.wait_started {
                 timeout = timeout.min(INDICATOR_DELAY.saturating_sub(started.elapsed()));
             }
+            // The list's `searching…` lights past the delay, so a slow answer is signalled.
+            if let Some(wait) = app.lsp_indicator_wait() {
+                timeout = timeout.min(wait);
+            }
             if app.config_error().is_none()
                 && let Some(wait) = app.base_probe_wait()
             {
@@ -1401,6 +1537,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
     })();
     restore_terminal();
     drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
+    // Every server ends with the pane: each worker shuts its servers down within their grace.
+    lsp_stopping.extend(lsp.take().map(|link| link.handle));
+    for handle in lsp_stopping {
+        let _ = handle.join();
+    }
     result
 }
 
@@ -1868,6 +2009,21 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
         return Ok(());
     }
 
+    // The locations list: move, `enter` opens or chooses, `edit` opens the place in the editor.
+    if app.mode == Mode::Locations {
+        match (action, key.code) {
+            (_, Esc) => app.close_locations(),
+            (_, Enter) => app.locations_open()?,
+            (Some(K::Down), _) => app.locations_move(1),
+            (Some(K::Up), _) => app.locations_move(-1),
+            (Some(K::PageDown), _) => app.locations_move(PAGE),
+            (Some(K::PageUp), _) => app.locations_move(-PAGE),
+            (Some(K::Edit), _) => app.locations_edit(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // The comments list closes on `esc` or `comments`.
     if app.mode == Mode::List {
         match (action, key.code) {
@@ -1941,8 +2097,12 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::Search => app.open_search(),
             K::Find => app.open_find(),
             K::GotoLine => app.open_line(),
+            K::Definition => app.ask_lsp(crate::lsp::Kind::Definition)?,
+            K::References => app.ask_lsp(crate::lsp::Kind::References)?,
             K::Keys => app.toggle_keys(),
             // Inert here; `quit-discard` only answers the quit question.
+            K::Back => app.walk_history(false)?,
+            K::Forward => app.walk_history(true)?,
             K::Delete | K::OpenPr | K::QuitDiscard => {}
         }
         return Ok(());
@@ -2627,6 +2787,189 @@ fn dispatch_mouse(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lsp_tests {
+    use super::{LspLink, follow_lsp};
+    use crate::lsp::Kind;
+
+    /// A ready pane in All files on `a.go`, its gopls the fake server.
+    fn pane() -> (tempfile::TempDir, crate::app::App) {
+        let (repo, git) = crate::test_support::test_repo();
+        std::fs::write(repo.path().join("a.go"), "package a\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let mut app =
+            crate::app::App::new(repo.path().into(), crate::model::Scope::Uncommitted, None);
+        app.set_plugin_config(config(""));
+        app.reload().unwrap();
+        app.set_tab(crate::app::Tab::AllFiles).unwrap();
+        assert!(app.open_at("a.go", Some(1)).unwrap());
+        (repo, app)
+    }
+
+    fn config(extra: &str) -> crate::config::PluginConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = crate::test_support::fake_lsp().display().to_string();
+        std::fs::write(dir.path().join("config.toml"), format!("gopls = {fake:?}\n{extra}"))
+            .unwrap();
+        crate::config::plugin_config_in(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn a_new_config_restarts_and_re_asks_and_an_invalid_one_stops_the_worker() {
+        let (_repo, mut app) = pane();
+        app.ask_lsp(Kind::Definition).unwrap();
+        let asked = app.lsp_query.take().unwrap().tag.generation;
+        let mut lsp = LspLink::start(&app, &crate::wake::Waker::detached());
+        let (mut stopping, mut reopen) = (Vec::new(), false);
+        follow_lsp(&mut app, &mut lsp, &mut stopping, &mut reopen);
+        assert!(app.lsp_query.is_none(), "the same config asks nothing again");
+        app.set_plugin_config(config("clangd_index = true\n"));
+        follow_lsp(&mut app, &mut lsp, &mut stopping, &mut reopen);
+        let again = app.lsp_query.take().expect("the open list asks again");
+        assert!(again.tag.generation > asked, "under a new generation");
+        assert!(lsp.as_ref().is_some_and(|l| l.config.clangd_index()));
+        app.set_config_error("bad".into());
+        follow_lsp(&mut app, &mut lsp, &mut stopping, &mut reopen);
+        assert!(lsp.is_none() && stopping.len() == 1, "an invalid config stops the worker");
+        for handle in stopping {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn an_answer_queued_before_the_hide_never_reaches_the_hidden_pane() {
+        let (_repo, mut app) = pane();
+        app.ask_lsp(Kind::Definition).unwrap();
+        let tag = app.lsp_query.take().unwrap().tag;
+        let mut link = LspLink::start(&app, &crate::wake::Waker::detached()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        link.rx = rx;
+        let found = crate::lsp::Location {
+            place: crate::lsp::uri::Located::Repo("a.go".into()),
+            line: 1,
+            text: "package a".into(),
+            context: crate::lsp::Context::default(),
+        };
+        let outcome = crate::lsp::Outcome::Ready(vec![found]);
+        tx.send(crate::lsp::LspCompletion { tag, occurrence: Some(0), outcome }).unwrap();
+        app.sync_herdr_session(None, false);
+        link.set_open(false);
+        assert!(super::land_lsp(&mut app, &link), "drained");
+        let list = app.locations.as_ref().unwrap();
+        assert!(list.picked_place().is_none(), "and dropped: the hidden list did not change");
+    }
+
+    #[test]
+    fn a_config_changed_while_hidden_reaches_the_worker_before_the_re_ask() {
+        let (_repo, mut app) = pane();
+        app.ask_lsp(Kind::Definition).unwrap();
+        app.lsp_query = None;
+        let mut lsp = LspLink::start(&app, &crate::wake::Waker::detached());
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(link) = lsp.as_mut() {
+            // The link's jobs go to a probe, so their order is seen.
+            link.jobs = crate::lsp::Jobs::probe(tx);
+        }
+        app.sync_herdr_session(None, false);
+        // Shown again: the top of the loop reads the new config, then `follow_lsp` runs.
+        app.sync_herdr_session(None, true);
+        app.set_plugin_config(config("clangd_index = true\n"));
+        let (mut stopping, mut reopen) = (Vec::new(), true);
+        follow_lsp(&mut app, &mut lsp, &mut stopping, &mut reopen);
+        let first = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(matches!(first, crate::lsp::LspJob::Reconfigure(_)), "{first:?}");
+        assert!(app.lsp_query.is_some(), "then the open list asks again, of the new server");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_changed_while_hidden_replaces_the_running_server_before_the_re_ask_reaches_it() {
+        let (repo, mut app) = pane();
+        let script = repo.path().join(".fake-lsp");
+        std::fs::create_dir_all(&script).unwrap();
+        std::fs::write(script.join("silent"), "").unwrap();
+        let log = || std::fs::read_to_string(script.join("lsp.log")).unwrap_or_default();
+        let until = |done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "{}", log());
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let alive = |pid: &str| {
+            std::process::Command::new("kill").args(["-0", pid]).status().unwrap().success()
+        };
+        app.ask_lsp(Kind::Definition).unwrap();
+        let mut lsp = LspLink::start(&app, &crate::wake::Waker::detached());
+        let send = |lsp: &Option<LspLink>, app: &mut crate::app::App| {
+            let query = app.lsp_query.take().expect("a query");
+            lsp.as_ref().unwrap().jobs.send(crate::lsp::LspJob::Query(query));
+        };
+        send(&lsp, &mut app);
+        until(&|| log().contains("textDocument/definition"));
+        let asked = log().matches("textDocument/definition").count();
+        let old = std::fs::read_to_string(script.join("pid")).unwrap();
+        // Hidden, the pane reads no config; the file changes meanwhile.
+        app.sync_herdr_session(None, false);
+        lsp.as_ref().unwrap().set_open(false);
+        let moved = repo.path().join("gopls-moved");
+        std::os::unix::fs::symlink(crate::test_support::fake_lsp(), &moved).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), format!("gopls = {:?}\n", moved.display()))
+            .unwrap();
+        // Shown: the loop's top reads the file, then `follow_lsp`, then the dispatch after the paint.
+        app.sync_herdr_session(None, true);
+        app.set_plugin_config(crate::config::plugin_config_in(dir.path()).unwrap());
+        let (mut stopping, mut reopen) = (Vec::new(), true);
+        follow_lsp(&mut app, &mut lsp, &mut stopping, &mut reopen);
+        send(&lsp, &mut app);
+        until(&|| log().matches("textDocument/definition").count() > asked);
+        assert!(!alive(&old), "the old server is gone: {}", log());
+        let log = log();
+        let exit = log.rfind(r#""method":"exit""#).expect("the old server was shut down");
+        assert!(
+            exit < log.rfind("textDocument/definition").unwrap(),
+            "the re-ask came after: {log}"
+        );
+        let new = std::fs::read_to_string(script.join("pid")).unwrap();
+        assert_ne!(old, new, "and a new server answers it");
+        drop(lsp);
+    }
+
+    #[test]
+    fn a_shown_pane_opens_the_gate_and_asks_again_only_once_visible() {
+        let (_repo, mut app) = pane();
+        app.ask_lsp(Kind::Definition).unwrap();
+        app.lsp_query = None;
+        let mut lsp = LspLink::start(&app, &crate::wake::Waker::detached());
+        lsp.as_ref().unwrap().set_open(false);
+        let (mut stopping, mut reopen) = (Vec::new(), true);
+        app.sync_herdr_session(None, false);
+        follow_lsp(&mut app, &mut lsp, &mut stopping, &mut reopen);
+        assert!(reopen && app.lsp_query.is_none(), "a hidden pane waits");
+        app.sync_herdr_session(None, true);
+        follow_lsp(&mut app, &mut lsp, &mut stopping, &mut reopen);
+        assert!(!reopen && app.lsp_query.is_some(), "shown: the open list asks again");
+        assert!(*lsp.as_ref().unwrap().gate.lock().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    #[test]
+    fn a_place_outside_the_worktree_reaches_the_editor_as_its_own_absolute_path() {
+        let (repo, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let header = elsewhere.path().join("shared_ptr.h");
+        let path = super::edit_path(repo.path(), &header);
+        assert_eq!(path, header);
+        let command = crate::editor::resolve(None, None, Some("vim"), || None, &path, 88).unwrap();
+        assert_eq!(command.args, ["+88", header.to_str().unwrap()]);
+        let inside = super::edit_path(repo.path(), std::path::Path::new("src/user.cpp"));
+        assert_eq!(inside, repo.path().join("src/user.cpp"));
+    }
 }
 
 #[cfg(test)]

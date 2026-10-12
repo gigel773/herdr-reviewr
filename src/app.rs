@@ -327,6 +327,8 @@ pub enum Mode {
     Search,
     /// The read pane's foot band: find in the file, or a line to jump to.
     Find,
+    /// What `D` or `R` found for the cursor's line.
+    Locations,
 }
 
 impl Mode {
@@ -334,7 +336,12 @@ impl Mode {
     pub fn is_modal(&self) -> bool {
         matches!(
             self,
-            Mode::Composing { .. } | Mode::List | Mode::Picker | Mode::BasePick | Mode::CommitPick
+            Mode::Composing { .. }
+                | Mode::List
+                | Mode::Picker
+                | Mode::BasePick
+                | Mode::CommitPick
+                | Mode::Locations
         )
     }
 }
@@ -549,6 +556,16 @@ pub enum FooterAction {
     MoveBaseRow,
     /// Open the commit picker.
     CommitPick,
+    /// Ask the language server about the cursor's line.
+    Definition,
+    References,
+    /// Walk the jump history.
+    Back,
+    Forward,
+    /// The locations list's bar: open the place, or choose the symbol `R` looks up.
+    OpenLocation,
+    MoveLocation,
+    CloseLocations,
     /// The commit picker's bar.
     PickCommitRun,
     MoveCommitRow,
@@ -572,10 +589,10 @@ pub enum Band {
     Move,
 }
 
-/// The file `edit` opens: a repository-relative path and the 1-based line to open it at
+/// The file `edit` opens, relative to the repo or absolute outside it, and the 1-based line
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditTarget {
-    pub path: String,
+    pub path: PathBuf,
     pub line: u32,
 }
 
@@ -626,6 +643,8 @@ pub struct App {
     pub reveal_diff: bool,
     /// Set by `goto_line`: center a cursor that landed off screen, not nudge it to the edge.
     pub reveal_center: bool,
+    /// Set by a definition jump: land the cursor in the pane's upper part, its body below.
+    pub reveal_lead: bool,
     /// The file crossing a hunk step armed at the file's last hunk.
     armed_cross: Option<ArmedCross>,
     /// Whether this compose opened from the comments list, to return there.
@@ -741,6 +760,19 @@ pub struct App {
     pub search_track: Option<String>,
     /// A file an `edit` press named, for the event loop to open.
     pub editor_request: Option<EditTarget>,
+    /// The locations list while `mode == Mode::Locations`, `None` otherwise.
+    pub locations: Option<crate::locations::Locations>,
+    /// A query to dispatch after the frame paints.
+    pub lsp_query: Option<crate::lsp::Query>,
+    /// The list closed with a query out: the event loop cancels it.
+    pub lsp_cancel: bool,
+    /// Where `back` and `forward` lead.
+    pub history: crate::locations::History,
+    /// Where the press that opened the list stood, before a `Changes` row landed in the worktree.
+    lsp_origin: Option<crate::locations::Place>,
+    lsp_generation: u64,
+    /// The File view's path and [`crate::lsp::content_hash`], which a query is checked against.
+    shown: Option<(String, u64)>,
     /// The band's state — find or the line field — while `mode == Mode::Find`, `None` otherwise
     pub find: Option<Find>,
     /// Whether the refresh glyph paints this frame.
@@ -848,6 +880,7 @@ impl App {
             reveal_files: false,
             reveal_diff: false,
             reveal_center: false,
+            reveal_lead: false,
             armed_cross: None,
             resume_list: false,
             toggled_dirs: HashSet::new(),
@@ -912,6 +945,13 @@ impl App {
             search_dirty: false,
             search_track: None,
             editor_request: None,
+            locations: None,
+            lsp_query: None,
+            lsp_cancel: false,
+            history: crate::locations::History::default(),
+            lsp_origin: None,
+            lsp_generation: 0,
+            shown: None,
             find: None,
             refresh_indicator: false,
             refresh_commanded: false,
@@ -983,6 +1023,7 @@ impl App {
         self.close_picker();
         self.close_search();
         self.close_find();
+        self.close_locations();
         self.config = PluginConfigState::Blocked { error };
         self.pr_pending = None;
     }
@@ -1013,6 +1054,7 @@ impl App {
         self.last_sent_pane = old.last_sent_pane.take();
         // The commit pick is session memory like the comments: replaced, never cleared
         self.commit_pick = old.commit_pick.take();
+        self.history = std::mem::take(&mut old.history);
         self.navigator_side_pct = old.navigator_side_pct;
         self.navigator_stack_pct = old.navigator_stack_pct;
         self.navigator_hidden = old.navigator_hidden;
@@ -1029,7 +1071,7 @@ impl App {
         let old_mode = old.mode.clone();
         match old_mode {
             // `set_config_error` already closed these.
-            Mode::Normal | Mode::Search | Mode::Find | Mode::Picker => {}
+            Mode::Normal | Mode::Search | Mode::Find | Mode::Picker | Mode::Locations => {}
             Mode::List | Mode::Composing { .. } | Mode::BasePick | Mode::CommitPick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
@@ -1362,6 +1404,7 @@ impl App {
         self.diff_path = Some(path.to_string());
         self.expanded_folds.clear(); // the File view has no folds
         let (diff, content) = self.file_view(path);
+        self.shown = Some((path.to_string(), crate::lsp::content_hash(&content)));
         // A notice never renders, so its content is not held.
         let renders = self.markdown_file() && diff.notice.is_none();
         self.rendered.content = if renders { self.content(content, None) } else { None };
@@ -2424,17 +2467,32 @@ impl App {
 
     /// Center the cursor's row by display heights when it sits off screen.
     pub fn center_diff_cursor(&mut self, heights: &[usize], viewport: usize) {
+        self.place_diff_cursor(heights, viewport, viewport, 2);
+    }
+
+    /// Put the cursor's row a quarter down the pane unless it already sits in the upper two thirds.
+    pub fn lead_diff_cursor(&mut self, heights: &[usize], viewport: usize) {
+        self.place_diff_cursor(heights, viewport, viewport * 2 / 3, 4);
+    }
+
+    /// Fill `1/share` of the pane above the cursor, unless the top through it already fits `settled`.
+    fn place_diff_cursor(
+        &mut self,
+        heights: &[usize],
+        viewport: usize,
+        settled: usize,
+        share: usize,
+    ) {
         if heights.is_empty() || viewport == 0 {
             return;
         }
         let target = self.diff_cursor.min(heights.len() - 1);
         let in_view = self.diff_scroll <= target
-            && heights[self.diff_scroll..=target].iter().sum::<usize>() <= viewport;
+            && heights[self.diff_scroll..=target].iter().sum::<usize>() <= settled.max(1);
         if in_view {
             return;
         }
-        // Rows above the target fill about half of what the target leaves of the pane.
-        let room = viewport.saturating_sub(heights[target]) / 2;
+        let room = viewport.saturating_sub(heights[target]) / share;
         let mut top = target;
         let mut above = 0;
         while top > 0 && above + heights[top - 1] <= room {
@@ -2444,10 +2502,13 @@ impl App {
         self.diff_scroll = top;
     }
 
-    /// Settle the scroll: a line jump centers (eating a same-event nudge), else nudge, then bound.
+    /// Settle the scroll: a jump leads or centers (eating a same-event nudge), else nudge, then bound.
     pub fn settle_diff_scroll(&mut self, heights: &[usize], viewport: usize) {
         let nudge = std::mem::take(&mut self.reveal_diff);
-        if std::mem::take(&mut self.reveal_center) {
+        let center = std::mem::take(&mut self.reveal_center);
+        if std::mem::take(&mut self.reveal_lead) {
+            self.lead_diff_cursor(heights, viewport);
+        } else if center {
             self.center_diff_cursor(heights, viewport);
         } else if nudge || self.composing() {
             self.reveal_diff_cursor(heights, viewport);
@@ -3384,7 +3445,7 @@ impl App {
                 .and_then(|above| above.iter().rev().find_map(Row::new_no))
                 .unwrap_or(1)
         };
-        Some(EditTarget { path, line })
+        Some(EditTarget { path: path.into(), line })
     }
 
     fn edit_comment(&mut self) {
@@ -3431,7 +3492,7 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
-            Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick => None,
+            Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick | Mode::Locations => None,
         }
     }
 
@@ -3788,7 +3849,8 @@ impl App {
             | Mode::BasePick
             | Mode::CommitPick
             | Mode::Search
-            | Mode::Find => None,
+            | Mode::Find
+            | Mode::Locations => None,
         }
     }
 
@@ -4347,25 +4409,43 @@ impl App {
             return Ok(());
         }
         self.close_search();
+        // The pick feeds the engine's frecency store, so ranking improves with use.
+        self.search_track = Some(path.clone());
+        self.open_at(&path, line.map(|l| u32::try_from(l).unwrap_or(u32::MAX)))?;
+        Ok(())
+    }
+
+    /// Open a worktree file in `All files` at `line`; `false`, place untouched, when it is gone.
+    pub fn open_at(&mut self, path: &str, line: Option<u32>) -> Result<bool> {
+        if !self.repo.join(path).is_file() {
+            return Ok(false);
+        }
         // The origin tab stashes its place.
         if self.tab != Tab::AllFiles {
             self.set_tab(Tab::AllFiles)?;
         }
-        // The pick feeds the engine's frecency store, so ranking improves with use.
-        self.search_track = Some(path.clone());
         let mut expanded = false;
-        let mut dir = path.as_str();
+        let mut dir = path;
         while let Some((parent, _)) = dir.rsplit_once('/') {
             expanded |= self.set_dir_expanded(parent, true);
             dir = parent;
         }
-        if expanded {
-            // Search never returns an ignored path, so no worktree walk is needed.
+        // Newer than the listing: a provisional row now, the real one when the refresh lands.
+        let unlisted = !self.entries.iter().any(|e| e.path == path);
+        if unlisted {
+            let at = self.entries.partition_point(|e| e.path.as_str() < path);
+            let entry =
+                Entry { path: path.to_string(), annotation: None, ignored: false, is_dir: false };
+            self.entries.insert(at, entry);
+            self.request_paced_refresh(crate::world::Refresh::paths([path.to_string()]));
+        }
+        if expanded || unlisted {
+            // Callers open no ignored path, so no worktree walk is needed.
             self.rebuild_file_rows();
         }
         self.reset_diff_view();
-        self.set_file_view(&path);
-        if let Some(fi) = self.file_row_of_path(&path) {
+        self.set_file_view(path);
+        if let Some(fi) = self.file_row_of_path(path) {
             self.file_cursor = fi;
             self.reveal_files = true;
         }
@@ -4374,14 +4454,257 @@ impl App {
             // Rendered, land on the block holding the line.
             let last = self.visible.len().saturating_sub(1);
             self.diff_cursor = if self.rendered_active() {
-                let line = u32::try_from(line).unwrap_or(u32::MAX);
                 self.rendered.index.row_at_line(line).unwrap_or(0)
             } else {
                 (line.saturating_sub(1) as usize).min(last)
             };
         }
         self.reveal_diff = true;
+        Ok(true)
+    }
+
+    /// Whether `D` and `R` act here: a file tab's source view of a file a server answers for.
+    pub fn lsp_available(&self) -> bool {
+        self.tab.is_file_tab()
+            && !self.rendered_active()
+            && self.diff_path.as_deref().is_some_and(|p| crate::lsp::servers::for_path(p).is_some())
+    }
+
+    /// `D` or `R`: list what the server says about the cursor line's identifiers, from the worktree.
+    pub fn ask_lsp(&mut self, kind: crate::lsp::Kind) -> Result<()> {
+        if !self.tab.is_file_tab() || self.diff_path.is_none() {
+            return Ok(());
+        }
+        if !self.lsp_available() {
+            self.status = if self.rendered_active() {
+                "definitions read the source: switch the view to source".into()
+            } else {
+                "no language server for this file".into()
+            };
+            return Ok(());
+        }
+        let origin = self.here();
+        if self.tab == Tab::Changes && !self.land_in_worktree()? {
+            return Ok(());
+        }
+        let (Some(path), Some(row)) = (self.diff_path.clone(), self.visible.get(self.diff_cursor))
+        else {
+            return Ok(());
+        };
+        let Some(line) = row.new_no() else { return Ok(()) };
+        let Some((_, server)) = crate::lsp::servers::for_path(&path) else { return Ok(()) };
+        let mut occurrences = crate::lsp::occurrences(&row.text());
+        occurrences.retain(|o| !server.is_keyword(&path, &o.name));
+        if occurrences.is_empty() {
+            self.status = "no symbol on this line".into();
+            return Ok(());
+        }
+        // What a server would read must be what is shown; the worker checks again before it asks.
+        let hash = self.shown.as_ref().filter(|(p, _)| *p == path).map(|(_, h)| *h);
+        let on_disk =
+            worktree_content(&self.repo, &path).ok().map(|t| crate::lsp::content_hash(&t));
+        let Some(hash) = hash.filter(|h| on_disk == Some(*h)) else {
+            self.status = "the file changed on disk: refresh, then ask again".into();
+            return Ok(());
+        };
+        self.lsp_generation += 1;
+        let tag = crate::lsp::Tag { generation: self.lsp_generation, path, hash, line };
+        let mut list = crate::locations::Locations::new(kind, tag, occurrences);
+        let setup = self.diff_path.as_deref().and_then(crate::lsp::servers::for_path);
+        list.notice =
+            setup.and_then(|(_, server)| server.missing_setup(&self.repo)).map(str::to_string);
+        self.lsp_query = Some(list.query());
+        self.locations = Some(list);
+        self.lsp_origin = origin;
+        self.mode = Mode::Locations;
         Ok(())
+    }
+
+    /// Where the cursor stands, as the history keeps it.
+    fn here(&self) -> Option<crate::locations::Place> {
+        let path =
+            self.diff_path.clone().filter(|_| self.tab.is_file_tab() && !self.rendered_active())?;
+        let line = source_line_at(&self.visible, self.diff_cursor)?;
+        // A fold's own lines count: the cursor may stand on one.
+        let row = crate::marks::diff_lines(&self.visible).find(|row| row.new_no() == Some(line));
+        let text = row.map(Row::text).unwrap_or_default();
+        Some(crate::locations::Place { tab: self.tab, path, line, text })
+    }
+
+    /// `back` or `forward`: walk the history, past places whose file is gone.
+    pub fn walk_history(&mut self, forward: bool) -> Result<()> {
+        let here = self.here();
+        while let Some(to) = self.history.take(forward) {
+            if self.go_to(&to)? {
+                if let Some(here) = here {
+                    self.history.left(here, forward);
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Land on `place` in its own tab while that lists the file, else `All files`; `false` if gone.
+    fn go_to(&mut self, place: &crate::locations::Place) -> Result<bool> {
+        if !self.repo.join(&place.path).is_file() {
+            return Ok(false);
+        }
+        // `Changes` while its diff still holds the line; else the worktree's own file.
+        if place.tab == Tab::Changes {
+            self.set_tab(Tab::Changes)?;
+            if let Some(row) = self.file_row_of_path(&place.path) {
+                self.select_file(row)?;
+                if let Some(line) = self.line_like(place) {
+                    self.focus = Focus::Diff;
+                    self.land_at(line);
+                    return Ok(true);
+                }
+            }
+        }
+        if !self.open_at(&place.path, Some(place.line))? {
+            return Ok(false);
+        }
+        let line = self.line_like(place).unwrap_or(place.line);
+        self.land_at(line);
+        Ok(true)
+    }
+
+    /// The new-side line with `place`'s text nearest its line, folded ones included.
+    fn line_like(&self, place: &crate::locations::Place) -> Option<u32> {
+        let same = crate::marks::diff_lines(&self.visible).filter(|row| row.text() == place.text);
+        same.filter_map(Row::new_no).min_by_key(|n| n.abs_diff(place.line))
+    }
+
+    /// Put the cursor on new-side `line`, opening its fold, led; a line past the end clamps.
+    fn land_at(&mut self, line: u32) {
+        self.diff_cursor = self.land_on_line(line, Row::new_no);
+        self.reveal_lead = true;
+        self.reveal_diff = true;
+    }
+
+    /// From a `Changes` row, open the worktree file at its line; `false`, said in the status, if not.
+    fn land_in_worktree(&mut self) -> Result<bool> {
+        let (Some(path), Some(row)) = (self.diff_path.clone(), self.visible.get(self.diff_cursor))
+        else {
+            return Ok(false);
+        };
+        let worktree_side = self.scope != Scope::Commits
+            && self.changeset.ends.as_ref().is_some_and(|ends| ends.new.is_none());
+        let (Some(line), true) = (row.new_no(), worktree_side) else {
+            self.status = "definitions follow the worktree: this line is not in it".into();
+            return Ok(false);
+        };
+        let text = row.text();
+        if !self.open_at(&path, Some(line))? {
+            self.status = format!("{path} is gone");
+            return Ok(false);
+        }
+        // Git may show a line its filters or a newer edit changed on disk: ask what is there.
+        if self.visible.get(self.diff_cursor).is_none_or(|row| row.text() != text) {
+            self.status = "this line reads differently on disk: ask again here".into();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// How long until the open list's wait shows `searching…`, while it is still to come.
+    pub fn lsp_indicator_wait(&self) -> Option<Duration> {
+        // A hidden pane paints nothing, so nothing to wake for.
+        let list = self.locations.as_ref().filter(|l| l.pending() && self.pane_visible())?;
+        let left = crate::INDICATOR_DELAY.saturating_sub(list.asked_at.elapsed());
+        (!left.is_zero()).then_some(left)
+    }
+
+    /// Ask what the open list still waits for again: answers a hide or a restart dropped.
+    pub fn reask_lsp(&mut self) {
+        let Some(list) = self.locations.as_mut().filter(|l| l.pending()) else { return };
+        self.lsp_generation += 1;
+        list.reask(crate::lsp::Tag { generation: self.lsp_generation, ..list.tag.clone() });
+        self.lsp_query = Some(list.query());
+    }
+
+    /// Land an answer for the open list; any other query's answer is dropped.
+    pub fn apply_lsp_completion(&mut self, completion: crate::lsp::LspCompletion) {
+        let Some(list) = self.locations.as_mut().filter(|l| l.tag == completion.tag) else {
+            return;
+        };
+        list.land(completion.occurrence, completion.outcome);
+        if let Some(occurrence) = list.sole_choice() {
+            self.choose_references(occurrence);
+        }
+    }
+
+    /// `R`'s symbol chosen: ask for its references.
+    fn choose_references(&mut self, occurrence: usize) {
+        let Some(list) = self.locations.as_mut() else { return };
+        if occurrence >= list.occurrences.len() {
+            return;
+        }
+        self.lsp_generation += 1;
+        let tag = crate::lsp::Tag { generation: self.lsp_generation, ..list.tag.clone() };
+        list.choose(occurrence, tag);
+        self.lsp_query = Some(list.query());
+        // The definitions still out are for the old stage.
+        self.lsp_cancel = true;
+    }
+
+    pub fn locations_move(&mut self, delta: isize) {
+        if let Some(list) = self.locations.as_mut() {
+            list.step(delta);
+        }
+    }
+
+    /// `enter`: choose `R`'s symbol, or open a worktree place; an outside one only says so.
+    pub fn locations_open(&mut self) -> Result<()> {
+        let Some(list) = self.locations.as_ref() else { return Ok(()) };
+        if let Some(occurrence) = list.picked_group() {
+            self.choose_references(occurrence);
+            return Ok(());
+        }
+        let Some(place) = list.picked_place().cloned() else { return Ok(()) };
+        let crate::lsp::uri::Located::Repo(path) = &place.place else {
+            self.status = format!(
+                "outside the worktree: {} opens it",
+                self.keymap().hint(crate::keymap::Action::Edit).label()
+            );
+            return Ok(());
+        };
+        if !self.repo.join(path).is_file() {
+            self.status = format!("{path} is gone");
+            return Ok(());
+        }
+        let from = self.lsp_origin.take().or_else(|| self.here());
+        self.close_locations();
+        if !self.open_at(path, Some(place.line))? {
+            return Ok(());
+        }
+        self.land_at(place.line);
+        if let Some(from) = from {
+            self.history.jumped(from);
+        }
+        Ok(())
+    }
+
+    /// `edit`: open the picked place in the editor, wherever it is.
+    pub fn locations_edit(&mut self) {
+        let Some(place) = self.locations.as_ref().and_then(|l| l.picked_place()) else { return };
+        let path = match &place.place {
+            crate::lsp::uri::Located::Repo(path) => PathBuf::from(path),
+            crate::lsp::uri::Located::External(path) => path.clone(),
+        };
+        self.editor_request = Some(EditTarget { path, line: place.line });
+    }
+
+    /// `esc`: drop the list, place untouched; a query still out is cancelled.
+    pub fn close_locations(&mut self) {
+        if self.mode == Mode::Locations {
+            self.mode = Mode::Normal;
+        }
+        if self.locations.take().is_some_and(|l| l.pending()) {
+            self.lsp_cancel = true;
+        }
+        self.lsp_query = None;
     }
 
     pub fn open_list(&mut self) {
@@ -4439,6 +4762,23 @@ impl App {
                 // The pick row takes no anchor, so `v` is not offered on it.
                 if self.commit_picker.as_ref().is_some_and(|cp| !cp.is_pick_row(cp.cursor)) {
                     out.push((A::CommitAnchor, Do));
+                }
+                return out;
+            }
+            Mode::Locations => {
+                let Some(l) = self.locations.as_ref() else {
+                    return vec![(A::CloseLocations, Primary)];
+                };
+                if l.picked().is_none() {
+                    return vec![(A::CloseLocations, Primary)];
+                }
+                let mut out = vec![
+                    (A::OpenLocation, Primary),
+                    (A::CloseLocations, Do),
+                    (A::MoveLocation, Do),
+                ];
+                if l.picked_place().is_some() {
+                    out.push((A::EditFile, Do));
                 }
                 return out;
             }
@@ -4589,6 +4929,16 @@ impl App {
             out.push((A::CommitPick, Go));
         }
         out.push((A::Search, Go));
+        if self.lsp_available() {
+            out.push((A::Definition, Go));
+            out.push((A::References, Go));
+        }
+        if self.history.can_back() {
+            out.push((A::Back, Go));
+        }
+        if self.history.can_forward() {
+            out.push((A::Forward, Go));
+        }
         // In-file find shows wherever the read pane has content to search.
         if self.find_available() {
             out.push((A::Find, Go));
@@ -5255,7 +5605,10 @@ fn is_markdown_path(path: &str) -> bool {
 }
 
 /// `path`'s worktree text, regular files only: over the budget, the notice, never read.
-fn worktree_content(repo: &std::path::Path, path: &str) -> Result<String, crate::diff::Notice> {
+pub(crate) fn worktree_content(
+    repo: &std::path::Path,
+    path: &str,
+) -> Result<String, crate::diff::Notice> {
     use std::io::{ErrorKind, Read};
     let at = repo.join(path);
     let meta = match std::fs::metadata(&at) {

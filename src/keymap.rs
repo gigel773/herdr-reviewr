@@ -42,6 +42,10 @@ pub enum Action {
     Search,
     Find,
     GotoLine,
+    Definition,
+    References,
+    Back,
+    Forward,
     Keys,
     Send,
     Copy,
@@ -130,6 +134,11 @@ impl Key {
         Self { ctrl: false, alt: false, code }
     }
 
+    /// An `alt+<named>` chord.
+    pub const fn alt(code: KeyCode) -> Self {
+        Self { ctrl: false, alt: true, code }
+    }
+
     /// The `ctrl+`/`alt+` prefixing both spellings share.
     fn prefixed(self, base: String) -> String {
         match (self.ctrl, self.alt) {
@@ -151,7 +160,7 @@ impl Key {
 }
 
 /// Every action with its config name and default keys, the one table the keymap derives from.
-const ACTIONS: [(Action, &str, &[Key]); 44] = [
+const ACTIONS: [(Action, &str, &[Key]); 48] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -189,6 +198,10 @@ const ACTIONS: [(Action, &str, &[Key]); 44] = [
     (Action::Search, "search", &[Key::plain('/')]),
     (Action::Find, "find", &[Key::ctrl('f')]),
     (Action::GotoLine, "goto-line", &[Key::plain(':')]),
+    (Action::Definition, "definition", &[Key::plain('D')]),
+    (Action::References, "references", &[Key::plain('R')]),
+    (Action::Back, "back", &[Key::alt(KeyCode::Left)]),
+    (Action::Forward, "forward", &[Key::alt(KeyCode::Right)]),
     (Action::Keys, "keys", &[Key::plain('?')]),
     (Action::Send, "send", &[Key::plain('s'), Key::plain('S')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
@@ -355,6 +368,23 @@ mod tests {
         assert_eq!(Action::by_config_name("list-wider"), Some(Action::NavigatorGrow));
         assert_eq!(Action::by_config_name("list-narrower"), Some(Action::NavigatorShrink));
         assert_eq!(Action::by_config_name("preview"), Some(Action::Rendered));
+    }
+
+    #[test]
+    fn navigation_defaults_to_capitals_and_alt_arrows() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.action_for(Key::plain('D')), Some(Action::Definition));
+        assert_eq!(keymap.action_for(Key::plain('R')), Some(Action::References));
+        assert_eq!(keymap.action_for(Key::alt(KeyCode::Left)), Some(Action::Back));
+        assert_eq!(keymap.action_for(Key::alt(KeyCode::Right)), Some(Action::Forward));
+        // The bare arrows keep their own actions, and the lowercase letters theirs.
+        assert_eq!(keymap.action_for(Key::named(KeyCode::Left)), Some(Action::Collapse));
+        assert_eq!(keymap.action_for(Key::plain('d')), Some(Action::Delete));
+        assert_eq!(keymap.action_for(Key::plain('r')), Some(Action::Refresh));
+        assert_eq!(keymap.hint(Action::Back).config_str(), "alt+left");
+        assert_eq!(keymap.hint(Action::Back).label(), "alt+←");
+        let rebound = Keymap::resolve(&[(Action::Back, vec![Key::ctrl('o')])]).unwrap();
+        assert_eq!(rebound.action_for(Key::ctrl('o')), Some(Action::Back));
     }
 
     #[test]

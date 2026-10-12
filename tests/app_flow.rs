@@ -799,7 +799,7 @@ fn the_footer_offers_edit_file_on_a_diff_with_no_rows() {
     let keymap = Keymap::default();
     press(&mut app, &keymap, KeyCode::Char('e'));
     let request = app.editor_request.expect("and the press opens it");
-    assert_eq!(request.path, "blob.bin");
+    assert_eq!(request.path, Path::new("blob.bin"));
     assert_eq!(request.line, 1, "at its start, since no row names a line");
 }
 
@@ -831,7 +831,7 @@ fn edit_reaches_a_file_the_changeset_only_calls_deleted() {
     let keymap = Keymap::default();
     press(&mut app, &keymap, KeyCode::Char('e'));
     assert_eq!(
-        app.editor_request.as_ref().map(|t| t.path.as_str()),
+        app.editor_request.as_ref().and_then(|t| t.path.to_str()),
         Some("here.rs"),
         "and the press names it"
     );
@@ -847,7 +847,7 @@ fn edit_opens_the_file_under_the_cursor_and_the_comment_when_one_is_there() {
     // `e` on an uncommented line names the worktree file, at that line, absolutely.
     press(&mut app, &keymap, KeyCode::Char('e'));
     let request = app.editor_request.take().expect("`e` names the file under the cursor");
-    assert_eq!(request.path, "a.rs");
+    assert_eq!(request.path, Path::new("a.rs"));
     assert!(!app.composing(), "and no comment box opens");
 
     // The same key on a commented line edits the comment instead.
@@ -861,7 +861,7 @@ fn edit_opens_the_file_under_the_cursor_and_the_comment_when_one_is_there() {
     app.focus = Focus::Files;
     press(&mut app, &keymap, KeyCode::Char('e'));
     let from_row = app.editor_request.take().expect("a file row names its file");
-    assert_eq!(from_row.path, "a.rs");
+    assert_eq!(from_row.path, Path::new("a.rs"));
     assert_eq!(from_row.line, 1, "a navigator row names no line, so the file opens at its start");
 
     // `All files` builds and anchors differently, so check it too.
@@ -870,7 +870,7 @@ fn edit_opens_the_file_under_the_cursor_and_the_comment_when_one_is_there() {
     app.diff_cursor = 2;
     press(&mut app, &keymap, KeyCode::Char('e'));
     let in_file_view = app.editor_request.take().expect("the File view names its file too");
-    assert_eq!(in_file_view.path, "a.rs");
+    assert_eq!(in_file_view.path, Path::new("a.rs"));
     assert_eq!(in_file_view.line, 3, "at the line the cursor is on, not the file's start");
 
     comment_on(&mut app, ' ', "content note");
@@ -4171,7 +4171,7 @@ fn the_pr_remedy_names_the_rebound_refresh_key() {
     use herdr_reviewr::forge::PrView;
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "[keybindings]\nrefresh = [\"R\"]\n").unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[keybindings]\nrefresh = [\"Z\"]\n").unwrap();
     let config = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
 
     let repo = Repo::init();
@@ -4185,7 +4185,7 @@ fn the_pr_remedy_names_the_rebound_refresh_key() {
     ));
 
     assert!(
-        app.pr_notice().is_some_and(|notice| notice.ends_with("then press R.")),
+        app.pr_notice().is_some_and(|notice| notice.ends_with("then press Z.")),
         "the remedy follows the active refresh binding: {:?}",
         app.pr_notice()
     );
@@ -7749,7 +7749,7 @@ fn edit_never_lands_a_commit_comment_on_a_worktree_line() {
     app.focus = herdr_reviewr::app::Focus::Diff;
     app.start_edit();
     let target = app.editor_request.take().unwrap();
-    assert_eq!((target.path.as_str(), target.line), ("three.rs", 1));
+    assert_eq!((target.path.to_str().unwrap(), target.line), ("three.rs", 1));
     comment_on(&mut app, '+', "commit note");
     assert_eq!(
         app.store.get(0).unwrap().rev,
@@ -9212,7 +9212,11 @@ fn edit_in_a_rendered_commit_diff_opens_the_file_at_its_start() {
     app.diff_cursor = rendered_row(&app, "more");
     app.start_edit();
     let target = app.editor_request.take().unwrap();
-    assert_eq!((target.path.as_str(), target.line), ("doc.md", 1), "the commit's numbers stay put");
+    assert_eq!(
+        (target.path.to_str().unwrap(), target.line),
+        ("doc.md", 1),
+        "the commit's numbers stay put"
+    );
 }
 
 #[test]
@@ -10165,6 +10169,19 @@ fn goto_line_centers_an_off_screen_line_and_keeps_an_on_screen_one() {
     (app.diff_cursor, app.diff_scroll) = (49, 0);
     app.center_diff_cursor(&heights, 10);
     assert_eq!(app.diff_scroll, 49);
+
+    // A definition jump leads: a quarter of the pane above, its body below.
+    let heights = vec![1usize; app.visible.len()];
+    (app.diff_cursor, app.diff_scroll) = (49, 0);
+    app.lead_diff_cursor(&heights, 12);
+    assert_eq!(app.diff_scroll, 47, "11 rows left, 2 above line 50 and 9 below");
+    // Low on screen counts as off screen; the upper two thirds stay put.
+    (app.diff_cursor, app.diff_scroll) = (58, 47);
+    app.lead_diff_cursor(&heights, 12);
+    assert_eq!(app.diff_scroll, 56);
+    (app.diff_cursor, app.diff_scroll) = (54, 47);
+    app.lead_diff_cursor(&heights, 12);
+    assert_eq!(app.diff_scroll, 47);
 }
 
 /// Rendered markdown lands on the block holding the line; a line inside a collapsed `<details>`

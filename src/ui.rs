@@ -110,6 +110,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::Picker => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
+        Mode::Locations => Some(render_locations),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
     if let Some(render_popup) = popup {
@@ -2692,7 +2693,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::Save => ("enter".into(), "save"),
         A::Newline => ("shift+enter".into(), "newline"),
         A::Cancel | A::ClosePicker => ("esc".into(), "cancel"),
-        A::CloseList | A::CloseSearch | A::CloseFind => ("esc".into(), "close"),
+        A::CloseList | A::CloseSearch | A::CloseFind | A::CloseLocations => ("esc".into(), "close"),
         A::PickAgent => ("enter".into(), "send"),
         // The digits are literal; the movement keys are bound.
         A::MovePickerRow => (format!("1-9 {} {}", hint(K::Down), hint(K::Up)), "move"),
@@ -2702,7 +2703,9 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             let n = app.commit_picker.as_ref().map_or(0, crate::app::CommitPicker::run_len);
             return ("enter".into(), if n > 1 { format!("open {n}") } else { "open".into() });
         }
-        A::MoveCommitRow => (format!("{} {}", hint(K::Down), hint(K::Up)), "move"),
+        A::MoveCommitRow | A::MoveLocation => {
+            (format!("{} {}", hint(K::Down), hint(K::Up)), "move")
+        }
         A::CloseCommitPicker => {
             let anchored = app.commit_picker.as_ref().is_some_and(|cp| cp.anchor.is_some());
             ("esc".into(), if anchored { "clear" } else { "cancel" })
@@ -2722,6 +2725,14 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             (others.join("/"), "scope")
         }
         A::Search => (hint(K::Search), "search"),
+        A::Definition => (hint(K::Definition), "definition"),
+        A::Back => (hint(K::Back), "back"),
+        A::Forward => (hint(K::Forward), "forward"),
+        A::References => (hint(K::References), "references"),
+        A::OpenLocation => {
+            let choosing = app.locations.as_ref().is_some_and(|l| l.picked_group().is_some());
+            ("enter".into(), if choosing { "references" } else { "open" })
+        }
         A::Find => (hint(K::Find), "find"),
         A::GotoLine => (hint(K::GotoLine), "line"),
         A::LineGo => ("enter".into(), "go"),
@@ -3044,6 +3055,151 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     frame.render_widget(List::new(items), inner);
+}
+
+/// The locations list's title: what was asked, about which line or symbol.
+fn locations_title(list: &crate::locations::Locations) -> String {
+    use crate::locations::Stage;
+    match (list.kind, list.stage) {
+        (_, Stage::References(i)) => {
+            format!("references to {}", list.occurrences.get(i).map_or("", |o| o.name.as_str()))
+        }
+        (crate::lsp::Kind::Definition, Stage::Definitions) => {
+            format!("definitions on line {}", list.tag.line)
+        }
+        (crate::lsp::Kind::References, Stage::Definitions) => "references to which symbol?".into(),
+    }
+}
+
+fn render_locations(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::locations::Row as L;
+    let Some(list) = app.locations.as_ref() else { return };
+    let p = app.palette();
+    let body = panes(area, app).body;
+    let popup = body_popup(
+        area,
+        app,
+        body.width * LIST_POPUP_W_PCT / 100,
+        body.height * LIST_POPUP_H_PCT / 100,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.mark(Ink::Accent, Fill::Base)))
+        .title(framed_title(&locations_title(list)));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = list.rows();
+    // A wait shorter than the indicator delay shows nothing, so a fast answer never flashes.
+    let waited = list.asked_at.elapsed() >= crate::INDICATOR_DELAY;
+    let picked = list.picked();
+    let mut lines: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let on = cursor_fill(picked == Some(i));
+            let spans = match row {
+                L::Group { name, pending, signature, .. } => {
+                    let mut spans = vec![Span::styled(
+                        format!(" {name}"),
+                        Style::default().fg(p.ink(Ink::Accent, on)).add_modifier(Modifier::BOLD),
+                    )];
+                    if let Some(signature) = signature {
+                        spans.push(Span::styled(format!("  {signature}"), text_style(p, on)));
+                    }
+                    if *pending && waited {
+                        spans.push(Span::styled(
+                            "  searching…",
+                            Style::default().fg(p.ink(Ink::TextMuted, on)),
+                        ));
+                    }
+                    spans
+                }
+                L::Place { location, .. } => {
+                    let at = match &location.place {
+                        crate::lsp::uri::Located::Repo(path) => {
+                            format!("   {path}:{}", location.line)
+                        }
+                        crate::lsp::uri::Located::External(path) => {
+                            format!("   {}:{} (outside)", path.display(), location.line)
+                        }
+                    };
+                    vec![
+                        Span::styled(at, Style::default().fg(p.ink(Ink::TextSecondary, on))),
+                        Span::styled(format!("  {}", location.text), text_style(p, on)),
+                    ]
+                }
+            };
+            selectable_row(p, spans, inner.width as usize, on)
+        })
+        .collect();
+    let status = match &list.notice {
+        Some(notice) => Some((notice.clone(), Ink::Warning)),
+        None if rows.is_empty() && !list.pending() => {
+            Some(("nothing found".into(), Ink::TextMuted))
+        }
+        None if rows.is_empty() && waited => Some(("searching…".into(), Ink::TextMuted)),
+        None => None,
+    };
+    if let Some((text, ink)) = status {
+        lines.push(ListItem::new(Line::from(Span::styled(
+            format!(" {text}"),
+            Style::default().fg(p.ink(ink, Fill::Base)),
+        ))));
+    }
+    // The picked place's context takes the lower part, the list keeps at least half.
+    let context = list.picked_place().filter(|l| !l.context.lines.is_empty());
+    let preview_h = context.map_or(0, |l| (l.context.lines.len() as u16 + 1).min(inner.height / 2));
+    let [list_area, preview_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(preview_h)]).areas(inner);
+    let first = menu_scroll(picked.unwrap_or(0), lines.len(), list_area.height as usize);
+    list.scroll.set(first);
+    frame.render_widget(List::new(lines.into_iter().skip(first).collect::<Vec<_>>()), list_area);
+    if let Some(location) = context.filter(|_| preview_h > 1) {
+        render_location_context(frame, p, location, preview_area);
+    }
+}
+
+/// The lines around a picked place under a rule naming their span, the place's own line marked.
+fn render_location_context(
+    frame: &mut Frame,
+    p: &Palette,
+    location: &crate::lsp::Location,
+    area: Rect,
+) {
+    let context = &location.context;
+    let last = context.from as usize + context.lines.len() - 1;
+    let gutter = last.to_string().len();
+    let path = match &location.place {
+        crate::lsp::uri::Located::Repo(path) => path.clone(),
+        crate::lsp::uri::Located::External(path) => path.display().to_string(),
+    };
+    let rule = format!("─ {path}:{}-{last} ", context.from);
+    let rule =
+        format!("{rule}{}", "─".repeat((area.width as usize).saturating_sub(rule.chars().count())));
+    let mut lines =
+        vec![Line::from(Span::styled(rule, Style::default().fg(p.mark(Ink::Accent, Fill::Base))))];
+    // A pane too short for all of it still shows the place's own line.
+    let hit = (location.line.saturating_sub(context.from)) as usize;
+    let skip = (hit + 2).saturating_sub(area.height as usize);
+    for (i, text) in context.lines.iter().enumerate().skip(skip) {
+        let n = context.from as usize + i;
+        let here = i == hit;
+        let (text, _) = expand_tabs(text, &[]);
+        let number =
+            Style::default().fg(p.ink(if here { Ink::Accent } else { Ink::TextMuted }, Fill::Base));
+        let body = if here {
+            text_style(p, Fill::Base).add_modifier(Modifier::BOLD)
+        } else {
+            text_style(p, Fill::Base)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}{n:>gutter$} ", if here { '>' } else { ' ' }), number),
+            Span::styled(text, body),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// A `w` × `h` popup centered in the body, never over the footer.

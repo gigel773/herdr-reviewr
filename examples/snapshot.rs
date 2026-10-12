@@ -40,6 +40,7 @@ const SCENES: &[Scene] = &[
     ("selection", scene_selection),
     ("pr", scene_pr),
     ("quit", scene_quit),
+    ("locations", scene_locations),
 ];
 
 fn main() {
@@ -401,6 +402,41 @@ fn scene_pr(repo: &Path, theme: &str) -> App {
 fn scene_quit(repo: &Path, theme: &str) -> App {
     let mut app = scene_diff(repo, theme);
     app.request_quit();
+    app
+}
+
+/// The locations list over the diff: places in and outside the worktree, one symbol still asked.
+fn scene_locations(repo: &Path, theme: &str) -> App {
+    use herdr_reviewr::lsp::{Context, Kind, Location, Occurrence, Outcome, Tag, uri::Located};
+    let mut app = scene_diff(repo, theme);
+    let names = ["total", "items", "discounts"];
+    let occurrences =
+        names.iter().enumerate().map(|(i, n)| Occurrence { name: (*n).into(), column: i * 8 });
+    let tag = Tag { generation: 1, path: "src.rs".into(), hash: 0, line: 3 };
+    let mut list =
+        herdr_reviewr::locations::Locations::new(Kind::Definition, tag, occurrences.collect());
+    let src = repo.join("src.rs");
+    let src = std::fs::read_to_string(src).unwrap_or_default();
+    let lines: Vec<String> = src.lines().map(Into::into).collect();
+    let here = |line: u32, text: &str| Location {
+        place: Located::Repo("src.rs".into()),
+        line,
+        text: text.into(),
+        context: Context {
+            from: 1,
+            lines: lines.iter().take(line as usize + 5).cloned().collect(),
+        },
+    };
+    list.land(Some(0), Outcome::Ready(vec![here(1, "pub fn total(items: &[Item]) -> u64 {")]));
+    let std = Location {
+        place: Located::External("/usr/lib/rust/src/slice.rs".into()),
+        line: 88,
+        text: "impl<T> [T] {".into(),
+        context: Context::default(),
+    };
+    list.land(Some(1), Outcome::Ready(vec![here(1, "pub fn total(items: &[Item]) -> u64 {"), std]));
+    app.locations = Some(list);
+    app.mode = herdr_reviewr::app::Mode::Locations;
     app
 }
 

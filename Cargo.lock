@@ -986,6 +986,7 @@ dependencies = [
  "toml",
  "two-face",
  "unicode-width",
+ "url",
  "which",
  "windows-sys 0.61.2",
 ]
